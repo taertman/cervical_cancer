@@ -1,0 +1,258 @@
+---
+title: "Constructing a risk model for cervical cancer"
+author: "Tom Ertman"
+date: "8/24/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r echo = FALSE}
+
+
+workdir<-getwd()
+fname<-"/cervdata.zip"
+path<-paste(workdir,fname,sep="")
+listdir<-"/cervical_cancer-master"
+url<-"https://github.com/taertman/cervical_cancer/archive/master.zip"
+
+download.file(url,path)
+unzip(path)
+csv_path<-paste(workdir,listdir,"/risk.csv",sep="")
+
+```
+### Introduction
+
+This dataset concists of 858 samples of 36 health features collected from female patients in regards to possible risk factors for cervical cancer. The object of this paper is to construct a risk model that includes factors from various diagnostic test so that a subject's risk may be ranked from 0, indicating low or no risk, to 4, indicating a high risk of cervical cancer.  Note that this dataset does not indicate whether a subject has cervical cancer.
+
+#### A complete feature list:
+
+
+
+
+
+```{r start, echo=FALSE,warning=FALSE,message=FALSE}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(imputeMissings)
+library(rpart)
+library(ROSE)
+library(randomForest)
+
+
+dfile<-read.csv(csv_path,header=TRUE,na.strings="?")
+
+
+
+
+```
+
+
+
+```{r init, echo=FALSE}
+names(dfile)
+```
+The features
+- Schiller
+- Hinselmann
+- Citology
+- Biopsy
+
+Are all medical tests designed to detect cancerous cells on the cervix.
+
+- Dx.CIN indicated a diagnoses of Cervical intraepithelial neoplasia
+- Dx.HPV indicates a diagnoses of Human Pappiloma Virus
+- Dx.Cancer indicates a previous diagnoses of cancer
+
+- Dx is unknown and dropped from the study
+
+### Analysis:
+
+There are a number of challenges with this dataset, namely the unbalanced nature of the postive results in the diagnostic tests which make constructing an accurate model difficult. 
+```{r disp}
+table(dfile$Schiller)
+table(dfile$Hinselmann)
+table(dfile$Citology)
+table(dfile$Biopsy)
+```
+There are columns with an significant amount of missing data as illustrated here
+
+```{r miss1}
+
+z<-sapply(dfile,function(x){
+  sum(is.na(x))
+})
+
+#features missing more than half of data
+names(z[which(unname(z)>400)])
+
+```
+
+
+
+We will deal with these issues by 
+
+1) for columns missing less than 25% of data, we will use imputation methods to assign values to missing features. For continuous data, we will substitute the median value for that column, for factors, the mode.
+2) we will discard features with a large amount of missing data >25%
+
+For data modeling, we will chose decision tree and randomforest algorithms using cross validation and feature tuning.
+
+We begin by dropping our Dx feature, then dropping our two columns that have a very high amount of NA
+
+```{r dropmiss}
+#drop dx
+dfile<-dfile[,-32]
+#drop the two highest NA features
+dfile<-dfile[,-28]
+dfile<-dfile[,-27]
+
+
+```
+
+Now we'll impute values on our dataset with the impute function to assign values to missing data
+```{r impute}
+df2<-imputeMissings::impute(dfile)
+#names(df2[nearZeroVar(dfile,freqCut = 99/1)])
+#df2<-df2[,-nearZeroVar(dfile)]
+```
+
+Our dataset is summarized here
+```{r summary}
+summary(df2)
+```
+Here we examine possible outliers to our dataset
+```{r plot}
+boxplot(df2$Number.of.sexual.partners,ylab="Number of sexual partners")
+boxplot(df2$First.sexual.intercourse,ylab="Age of first sexual intercourse")
+boxplot(df2$Num.of.pregnancies,ylab="Number of pregnancies")
+```
+Upon inspecting the data, we find an outlier to remove hence
+
+```{r outlier}
+out_sp<-outliers::outlier(df2$Number.of.sexual.partners)
+df2[which(df2$Number.of.sexual.partners==out_sp),]
+df2<-df2[!df2$Number.of.sexual.partners==out_sp,]
+```
+
+Finally, we create our aggragate risk factor:
+
+```{r factor}
+data_set<-df2%>%mutate(risk_level=Hinselmann+Schiller+Citology+Biopsy)
+data_set$risk_level<-factor(data_set$risk_level)
+
+```
+
+Now we seperate into train and test sets
+```{r seperate}
+#draw a sample from our completed dataset
+set.seed(1999)
+index<-createDataPartition(data_set$risk_level,p=0.8)
+
+#sepeate into train and test
+training_set<-data_set[index$Resample1,]
+test_set<-data_set[-index$Resample1,]
+```
+
+For our random forest model, we use 10 cross validations with a grid search for optimal parameters.
+
+```{r rfmodel}
+
+contrl=trainControl(method="cv",number=10,search="grid")
+
+#execute the model on our training set
+rf_model<-train(risk_level~.,data=training_set,method="rf",trControl=contrl)
+
+#produce the confusion matrix for our results
+confusionMatrix(predict(rf_model),training_set$risk_level)
+```
+Now we run our model on our test test:
+
+```{r model test}
+final_rf<-predict(rf_model,newdata=test_set)
+final_cf<-confusionMatrix(final_rf,test_set$risk_level)
+final_cf
+
+
+
+```
+
+For decision tree model we set up a parameter tuning grid that
+varies the split, complexity parameter, max depth
+
+```{r dtree params}
+
+
+split<-seq(1,20,2)
+cp=seq(.001,.02,.002)
+mdepth=seq(20,30,5)
+
+
+parameters=as.matrix(expand.grid(msplit=split,pval=cp,mxdepth=mdepth))
+```
+
+We construct a loop that manually applies each parameter and records the accuracy
+
+```{r dtreeloop}
+rpart_test<-function(msplit,p,mxdepth){
+  
+  contrl=rpart.control(minsplit=msplit,cp=p,maxdepth=mxdepth)
+  dtree=rpart(data=training_set,risk_level~.,control=contrl)
+  confusionMatrix(predict(dtree,type="class"),training_set$risk_level)$overall["Accuracy"]
+  
+}
+
+acc<-matrix()
+for ( i in seq(1,nrow(parameters))){
+  
+  
+   acc[i]<-rpart_test(parameters[i,1],parameters[i,2],parameters[i,3])   
+  
+}
+
+```
+Now we apply the optimal parameters to our model
+
+```{r dtree model}
+index<-first(which(acc==max(acc)))
+contrl<-rpart.control(minsplit=parameters[index,1],cp=parameters[index,2],maxdepth=parameters[index,3])
+
+dtree<-rpart(data=training_set,risk_level~.,control=contrl)
+confusionMatrix(predict(dtree,type="class"),training_set$risk_level)
+```
+Using the optimized hyperparameters for our model we get
+
+```{r dtree test}
+confusionMatrix(predict(dtree,newdata =test_set,type='class'),test_set$risk_level) 
+ 
+```
+
+### Summary
+
+Two models were run on our data and were both accurate in predicting aggragate risk levels associated with cervical cancer. However, we note that the variables used to contruct each respective model differ in importance
+
+
+```{r varimp}
+rforest<-head(arrange(varImp(rf_model)$importance,desc(Overall)),10)
+dctree<-head(arrange(varImp(dtree),desc(Overall)),10)
+
+```
+For our Random Forest model
+```{r rfv}
+rforest
+```
+and our Decision tree
+
+```{r dtv}
+dctree
+```
+
+Using the specificity and sensitiviy data for each test in combination with other tests we should be able to caculate how many subjects develop cancer and if all four diagnostic exams are necessary to make a diagnoses.  With image samples from diagnostics test we should be able to identify cancerous cells via machine learning and possibly elminate the need for painful tests such as a biopsy.
+
+
+
+
